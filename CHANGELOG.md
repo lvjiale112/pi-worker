@@ -4,6 +4,14 @@
 版本号声明在 `SKILL.md` 的 frontmatter `metadata.version`（锁内受管，
 `skillset update pi-worker --apply` 落锁后 `sync` 部署）。
 
+## [1.5.0] - 2026-10-10
+
+- pi 插件（worker-ext）新增汇报工具 `stage_report` / `final_report` / `ask_supervisor`：成果走结构化工具调用，piw 不再按标题猜；后两者调用后 pi 必然停下。修复里程碑里夹带「## 汇报」被误判为完工而叫醒监工。
+- `wait` 以 pi 真正停下为准：停下前最后一条是 `final_report` 为「完成汇报」，`ask_supervisor` 为「请示监工」，其余为「停下，等待指示」。
+- 插件在写入前拦截「不碰」清单（「改」清单里明确列出的路径优先）。
+- 新增 `piw scope <名> [add|keep-out <路径>...]`：运行中更新范围（`scope.json`），越界检查、写入拦截和并行冲突检查即时生效。
+- SKILL：同一检出并行时回归失败先归属、不处理对方领域。
+
 ## [1.4.0] - 2026-10-10
 
 - 多 worker 冲突检查：同一检出并行时，施工单必须写「改：」清单；派单时与在跑 worker 的「改」清单和已改文件比对，有交叉就拒绝派出（`--worktree` 不受限）。

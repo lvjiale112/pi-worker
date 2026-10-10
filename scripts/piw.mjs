@@ -16,6 +16,8 @@ const WIN = process.platform === "win32";
 const DEFAULTS = { model: "openai-codex/gpt-6.1-sol", thinking: "high", fast: true };
 const SHELL_TOOLS = new Set(["bash", "powershell"]);
 const CHANGE_TOOLS = new Set(["edit", "write"]);
+// worker-ext 提供的汇报工具：调用即结构化成果，不再从标题猜
+const REPORT_TOOLS = { stage_report: "milestone", final_report: "report", ask_supervisor: "ask" };
 // 用户的 pi 全局设置关掉了自动压缩和重试，RPC 开关又会写回全局设置，所以这两件事由 piw 自己做。
 const COMPACT_AT = 0.7;
 const MAX_RETRIES = 3;
@@ -142,9 +144,15 @@ function matches(rel, entry) {
 
 function scopeProblem(rel, scope) {
 	if (path.isAbsolute(rel)) return null; // cwd 之外（临时文件等）不管
-	if (scope.keepOut.some((e) => matches(rel, e))) return "在「不碰」清单里";
-	if (scope.change.length && !scope.change.some((e) => matches(rel, e))) return "不在「改」清单里";
+	const listed = scope.change.some((e) => matches(rel, e));
+	if (!listed && scope.keepOut.some((e) => matches(rel, e))) return "在「不碰」清单里";
+	if (scope.change.length && !listed) return "不在「改」清单里";
 	return null;
+}
+
+// 运行中的范围存在 scope.json，监工授权后用 piw scope 更新；旧运行目录没有它时读施工单
+function scopeOf(dir) {
+	return readJson(path.join(dir, "scope.json"), null) ?? parseScope(fs.readFileSync(path.join(dir, "brief.md"), "utf8"));
 }
 
 // ---------- 多 worker 冲突 ----------
@@ -172,7 +180,7 @@ function claimsOf(dir) {
 	if (!meta || status(dir).state === "exited") return null;
 	meta.checkout ??= checkoutOf(meta.cwd);
 	const up = (p) => toCheckout(meta, p);
-	const scope = parseScope(fs.readFileSync(path.join(dir, "brief.md"), "utf8"));
+	const scope = scopeOf(dir);
 	return {
 		name: meta.name,
 		checkout: meta.checkout,
@@ -254,7 +262,7 @@ function piArgs(meta, sessionFile) {
 		"--name", meta.name,
 		"--model", meta.model,
 		"--thinking", meta.thinking,
-		"--tools", `read,${shell},edit,write,grep,find,ls`,
+		"--tools", `read,${shell},edit,write,grep,find,ls,${Object.keys(REPORT_TOOLS).join(",")}`,
 		"-e", path.join(HERE, "worker-ext.ts"),
 		...(meta.extensions ?? []).flatMap((e) => ["-e", e]),
 		"--append-system-prompt", path.join(SKILL, "references", "worker-rules.md"),
@@ -271,7 +279,6 @@ async function daemon(name) {
 	const dir = runDir(name);
 	const meta = readJson(path.join(dir, "meta.json"));
 	const brief = fs.readFileSync(path.join(dir, "brief.md"), "utf8");
-	const scope = parseScope(brief);
 	meta.checkout ??= checkoutOf(meta.cwd);
 	const ownerOf = (f) => {
 		const top = toCheckout(meta, f);
@@ -418,17 +425,23 @@ async function daemon(name) {
 				if (CHANGE_TOOLS.has(rec.toolName)) {
 					const f = rel(rec.args?.path);
 					const owner = ownerOf(f);
-					if (!owner && !st.files.includes(f)) st.files.push(f);
-					const problem = owner ? `在跑的 worker ${owner} 负责这个文件，写入已拦截` : scopeProblem(f, scope);
+					const problem = owner ? `在跑的 worker ${owner} 负责这个文件` : scopeProblem(f, scopeOf(dir));
+					// 这两类写入由 worker-ext 拦下，不算本 worker 改过的文件
+					const blocked = Boolean(owner) || Boolean(problem?.includes("不碰"));
+					if (!blocked && !st.files.includes(f)) st.files.push(f);
 					if (problem && !st.flagged.includes(f)) {
 						st.flagged.push(f);
-						emit({ kind: "scope", hard: Boolean(owner) || problem.includes("不碰"), text: `${f}（${problem}）` });
+						emit({ kind: "scope", hard: blocked, text: `${f}（${problem}${blocked ? "，写入已拦截" : ""}）` });
 					}
 				}
 				break;
 			case "tool_execution_end":
 				st.activeTool = null;
 				save();
+				if (REPORT_TOOLS[rec.toolName] && !rec.isError) {
+					emit({ kind: REPORT_TOOLS[rec.toolName], text: rec.result?.details?.markdown ?? resultText(rec.result) });
+					break;
+				}
 				if (rec.isError) emit({ kind: "tool_error", tool: rec.toolName, text: tail(resultText(rec.result), 600) });
 				else if (SHELL_TOOLS.has(rec.toolName)) emit({ kind: "output", tool: rec.toolName, text: tail(resultText(rec.result), 400) });
 				break;
@@ -446,8 +459,7 @@ async function daemon(name) {
 					.join("\n")
 					.trim();
 				if (text) {
-					const kind = /^#{1,3}\s*汇报/m.test(text) ? "report" : /^#{1,3}\s*里程碑/m.test(text) ? "milestone" : "say";
-					emit({ kind, text });
+					emit({ kind: "say", text });
 				}
 				if (m.stopReason === "error") lastError = m.errorMessage ?? "未知错误";
 				else if (m.stopReason === "aborted") {
@@ -595,8 +607,8 @@ function results(dir, reason, upto = Infinity) {
 	if (changed.length) out.push(`本段改动：${changed.join(", ")}`);
 	for (const e of events.filter((e) => e.kind === "scope")) out.push(`⚠ ${e.hard === false ? "越出「改」清单" : "越界"}：${e.text}`);
 	for (const e of events.filter((e) => e.kind === "error" || e.kind === "note")) out.push(`${e.kind === "error" ? "错误" : "注"}：${e.text}`);
-	const reports = events.filter((e) => e.kind === "milestone" || e.kind === "report");
-	const lastSay = [...events].reverse().find((e) => ["say", "milestone", "report"].includes(e.kind));
+	const reports = events.filter((e) => ["milestone", "report", "ask"].includes(e.kind));
+	const lastSay = [...events].reverse().find((e) => ["say", "milestone", "report", "ask"].includes(e.kind));
 	const stopped = events.some((e) => e.kind === "settled" || e.kind === "exit");
 	for (const e of reports) out.push("", e.text);
 	if (stopped && lastSay && lastSay.kind === "say") out.push("", "—— 停下前的最后一段话 ——", lastSay.text);
@@ -612,7 +624,7 @@ function timeline(dir, since) {
 	const label = { tool_error: "  ↳ 出错", output: "  ↳", error: "错误", note: "注", boss: "监工", exit: "退出", scope: "⚠ 越界" };
 	const lines = events.map((e) => {
 		if (e.kind === "tool") return `#${e.seq} ${verb[e.tool] ?? e.tool} ${e.text}`;
-		if (["say", "milestone", "report"].includes(e.kind)) return `#${e.seq} 说：${clip(e.text, 240)}`;
+		if (["say", "milestone", "report", "ask"].includes(e.kind)) return `#${e.seq} ${e.kind === "say" ? "说" : "报"}：${clip(e.text, 240)}`;
 		if (e.kind === "settled") return `#${e.seq} —— 停下 ——`;
 		return `#${e.seq} ${label[e.kind] ?? e.kind}：${e.text}`;
 	});
@@ -695,7 +707,8 @@ async function cmdStart(name, opt) {
 
 ${brief}`);
 	}
-	const scope = parseScope(fs.readFileSync(path.join(dir, "brief.md"), "utf8"));
+	const scope = mine;
+	writeJson(path.join(dir, "scope.json"), scope);
 	spawnDaemon(dir, name, cwd);
 	await waitStarted(dir);
 	console.log(`已派单 ${name}：${meta.model}:${meta.thinking}${meta.fast ? " fast" : ""}`);
@@ -731,7 +744,7 @@ async function cmdWait(names, opt) {
 	const started = Date.now();
 	const deadline = opt.timeout ? started + Number(opt.timeout) * 1000 : Infinity;
 	const stallMs = Number(opt.stall ?? 30) * 60000;
-	const wakes = (e) => e.kind === "settled" || e.kind === "exit" || e.kind === "report"
+	const wakes = (e) => e.kind === "settled" || e.kind === "exit"
 		|| (e.kind === "scope" && (e.hard !== false || opt.milestones))
 		|| (e.kind === "milestone" && opt.milestones);
 	const watch = names.map((name) => {
@@ -744,11 +757,14 @@ async function cmdWait(names, opt) {
 		const st = status(dir);
 		if (hit.length || st.state === "exited") {
 			const kinds = new Set(hit.map((e) => e.kind));
+			const upto = hit.length ? hit.at(-1).seq : Infinity;
+			const signal = [...events].reverse().find((e) => e.seq > from && e.seq <= upto && ["report", "ask", "say", "milestone"].includes(e.kind))?.kind;
 			return {
 				// 截到最后一条触发事件，之后的动态留给下一次 wait
-				upto: hit.length ? hit.at(-1).seq : Infinity,
+				upto,
 				reason: kinds.has("exit") || st.state === "exited" ? "worker 已退出"
-					: kinds.has("report") ? "完成汇报"
+					: kinds.has("settled") && signal === "report" ? "完成汇报"
+					: kinds.has("settled") && signal === "ask" ? "请示监工"
 					: kinds.has("settled") ? "停下，等待指示"
 					: kinds.has("scope") ? "越界提醒"
 					: "里程碑",
@@ -767,6 +783,26 @@ async function cmdWait(names, opt) {
 		await sleep(2000);
 	}
 	console.log(watch.map((w) => results(w.dir, "超时，仍在施工")).join("\n\n"));
+}
+
+function cmdScope(name, [action, ...paths]) {
+	const dir = requireRun(name);
+	const scope = scopeOf(dir);
+	if (action) {
+		const key = { add: "change", "keep-out": "keepOut" }[action];
+		if (!key || !paths.length) die("用法：piw scope <名> [add|keep-out <路径>...]");
+		const clean = paths.map((p) => p.replaceAll("\\", "/").replace(/^\.\//, ""));
+		if (key === "change") {
+			const meta = readJson(path.join(dir, "meta.json"));
+			meta.checkout ??= checkoutOf(meta.cwd);
+			const clashes = conflicts(name, meta.checkout, clean.map((p) => toCheckout(meta, p)).filter(Boolean));
+			if (clashes.length) die(`和在跑的 worker 冲突（同一文件只能有一个写入者）：\n  ${clashes.join("\n  ")}`);
+		}
+		scope[key] = [...new Set([...scope[key], ...clean])];
+		writeJson(path.join(dir, "scope.json"), scope);
+	}
+	console.log(`改 [${scope.change.join(", ") || "未写，不检查"}]\n不碰 [${scope.keepOut.join(", ") || "无"}]`);
+	if (action) console.log("范围已更新：越界检查、写入拦截和并行冲突检查即时生效。要让 pi 知道，再 send 一句说明。");
 }
 
 async function cmdSend(name, opt, text) {
@@ -825,6 +861,7 @@ const USAGE = `用法：
              给多个名字时哪个先有结果就返回哪个
   piw log    <名> [--since 序号]            过程明细（默认最近 80 条）
   piw send   <名> "消息" | --file 文件      运行中插话，停下时派发新一轮
+  piw scope  <名> [add|keep-out <路径>...]   查看或扩充范围（授权 pi 改清单外的文件时用）
   piw abort  <名>
   piw resume <名> ["消息" | --file 文件]    进程退出后在原会话上恢复
   piw stop   <名> [--force]
@@ -844,6 +881,9 @@ switch (cmd) {
 		break;
 	case "send":
 		await cmdSend(pos[0], opt, pos.slice(1).join(" "));
+		break;
+	case "scope":
+		cmdScope(pos[0], pos.slice(1));
 		break;
 	case "abort":
 		await cmdAbort(pos[0]);
