@@ -2,7 +2,7 @@
 name: pi-worker
 description: 把已定方案交给本机 pi agent 施工并全程监工：写施工单、派单、往来通信、中途纠偏、验收。用户要求用 pi 施工、派活给 pi / 施工子代理、让 pi 写代码时使用。
 metadata:
-  version: 1.7.0
+  version: 1.7.1
 ---
 
 # pi 施工监工
@@ -137,6 +137,6 @@ pi 完成汇报后做一次完整审查：
 ## 运行环境
 
 - pi 以 RPC 模式常驻后台，没有权限弹窗。用户的扩展一律不加载，只加回两样：[worker-ext.ts](scripts/worker-ext.ts)（本技能的 pi 插件：三个汇报工具；写入「不碰」清单前拦截；拦截 git 写操作，会误拦 `git stash list` 这类只读命令）；装了 `@yen/pi-auto-mode` 时加载它作安全底线（危险命令、敏感文件、`.env` 写入拦截，需确认的操作在无人值守时直接拒绝）。start 输出会列出加载了哪些。扩展弹出的对话框一律自动取消。
-- 自动压缩和重试由 piw 实现，不改 `~/.pi/agent/settings.json`（pi 的同名 RPC 开关会写回全局设置）。
+- 自动压缩和重试由 piw 实现，不改 `~/.pi/agent/settings.json`（pi 的同名 RPC 开关会写回全局设置）。重试按 30 秒、1、2、4 分钟退避，能扛约 8 分钟断网；pi 交完工汇报或请示的那一轮不压缩。
 - worker 退出后运行目录保留；`piw list` 列出全部。同名 `start` 会覆盖已退出的旧目录。
 - 跨 worker 的写入拦截只拦 edit/write 工具；shell 命令写文件拦不住，靠验收时的 `git status` 发现。
