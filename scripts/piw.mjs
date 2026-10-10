@@ -838,7 +838,7 @@ async function cmdStop(name, opt) {
 		}
 	}
 	console.log(status(dir).state === "exited" ? "已收工" : "已请求收工；未退出可用 stop --force");
-	if (meta.worktree) console.log(`worktree 保留在 ${meta.worktree.path}（分支 ${meta.worktree.branch}），合并后自行 git worktree remove`);
+	if (meta.worktree) console.log(`worktree 保留在 ${meta.worktree.path}（分支 ${meta.worktree.branch}）。交付后先停 writer、核对路径并检查整树链接；Windows 用 scripts/check-worktree-removal.ps1。检查通过才普通 git worktree remove，不加 --force。`);
 }
 
 function cmdList() {

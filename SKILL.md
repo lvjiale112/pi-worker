@@ -2,7 +2,7 @@
 name: pi-worker
 description: 把已定方案交给本机 pi agent 施工并全程监工：写施工单、派单、往来通信、中途纠偏、验收。用户要求用 pi 施工、派活给 pi / 施工子代理、让 pi 写代码时使用。
 metadata:
-  version: 1.7.1
+  version: 1.7.2
 ---
 
 # pi 施工监工
@@ -68,6 +68,7 @@ node "$HOME/.claude/skills/pi-worker/scripts/piw.mjs" <命令> ...
 
 1. 先做项目规定的前置手续：读项目 `AGENTS.md`/`CLAUDE.md`，凡是领单、加锁、借数据之类的流程由你在派单前完成；pi 只施工。
 2. 选施工位置。长任务且只依赖 Git 跟踪的文件时加 `--worktree`：piw 在仓库旁建 `<仓库名>-pi-<名>` worktree 和分支 `pi/<名>`，pi 在里面干，主工作区不受影响。依赖未跟踪的数据、本地环境或台账的施工在原目录做，先记下 `git status --short` 作基线。
+   worktree 的运行时独立安装，或复制已确认可重建的文件；不得用 junction / symlink 挂接主仓库的运行时、数据或工作区。缺少独立环境时回到原目录施工，不能靠链接绕过隔离。
 3. 派单：
 
 ```
@@ -122,8 +123,8 @@ pi 完成汇报后做一次完整审查：
 1. 自己重跑施工单的验收命令，读完整 diff（worktree 用 `git diff <base>...pi/<名>`，base 在 start 输出里），并用 `git status` 对照基线核对改动文件：越界检查只看 edit/write 工具，pi 用 shell 命令写的文件只有这里能发现。
 2. 对照施工单逐项过下面四类偏差。判断依据是施工单和周围代码的现有习惯：项目本来就在边界做的校验、现有测试风格里的写法，不算偏差。
 3. 不合格就把问题按文件列成一份返工意见 `send` 过去，回到第 4 步。同一类问题第二次返工时，把它写成一条明确的规矩附在意见里；两轮返工仍不收敛，就 `stop`，把已确认的部分和教训写进新施工单重新派。
-4. 合格后 `piw stop <名>` 收工（卡住时 `--force`）。worktree 施工的，把 `pi/<名>` 合回来，再 `git worktree remove` 并删分支。
-5. 由你完成提交和项目规定的交付手续；pi 被扩展拦住了所有 git 写操作。
+4. 合格后 `piw stop <名>` 收工；卡住时 `piw stop <名> --force` 只用于强停进程。worktree 的改动完成交付后，先停掉使用该目录的所有 writer，再确认待删绝对路径是已登记的非主 worktree，检查路径本身、父路径和整个目录树中的链接（含隐藏及 Git 忽略项）。Windows 用 [check-worktree-removal.ps1](scripts/check-worktree-removal.ps1)：`pwsh -NoProfile -File <脚本绝对路径> -Repository <仓库绝对路径> -Worktree <待删绝对路径>`。发现任何 reparse point 或读取错误即停止；检查通过且确认改动已保存后，只用普通 `git worktree remove`，不得加 `--force`。检查脚本只读、不删除也不解除链接；检查后若目录有新写入，删除前重查。
+5. 每期或独立交付验收通过后，及时整理并提交已获用户授权的改动，不自行积攒多期。尚未获准提交时，交付具体文件清单和验证结果，保留待提交状态。用户明确要求联合提交时遵照执行，并验证联合候选本身；不能用混有未暂存改动的工作区测试代替提交快照验收。Git 写入和项目交付手续由监工完成，pi 的 Git 写操作仍被拦截。
 
 ### 四类偏差
 
