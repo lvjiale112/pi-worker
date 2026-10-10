@@ -1,6 +1,6 @@
 // 施工 worker 专用的 pi 扩展（由 piw 加载）：
 // - 汇报工具 stage_report / final_report / ask_supervisor：成果走结构化工具调用，piw 据此判断阶段、完工和请示；
-// - 写入守卫：「不碰」清单（$PIW_RUN_DIR/scope.json）和同检出其他 worker 负责的文件（foreign.json）在 edit/write 前拦截；
+// - 写入守卫：「不碰」清单（$PIW_RUN_DIR/scope.json，可由 piw scope 更新）在 edit/write 前拦截；
 // - git 写操作留给监工；--fast 走 OpenAI priority 档位。
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -38,20 +38,12 @@ function runFile<T>(name: string): T | undefined {
 }
 
 type Scope = { change: string[]; keepOut: string[] };
-type Foreign = { checkout: string; workers: { name: string; change: string[]; files: string[] }[] };
 
 // 写入被拒的理由；放行时返回 undefined
 function writeGuard(file: string, cwd: string) {
-	const abs = path.resolve(cwd, file);
-	const foreign = runFile<Foreign>("foreign.json");
-	if (foreign) {
-		const rel = norm(path.relative(foreign.checkout, abs));
-		const owner = foreign.workers.find((w) => w.change.some((e) => matches(rel, e)) || w.files.includes(rel));
-		if (owner) return `${file} 由同一工作区里在跑的 worker ${owner.name} 负责，同一文件只能有一个写入者。`;
-	}
 	const scope = runFile<Scope>("scope.json");
 	if (scope) {
-		const rel = norm(path.relative(cwd, abs));
+		const rel = norm(path.relative(cwd, path.resolve(cwd, file)));
 		if (!scope.change.some((e) => matches(rel, e)) && scope.keepOut.some((e) => matches(rel, e)))
 			return `${file} 在施工单的「不碰」清单里。`;
 	}

@@ -4,6 +4,12 @@
 版本号声明在 `SKILL.md` 的 frontmatter `metadata.version`（锁内受管，
 `skillset update pi-worker --apply` 落锁后 `sync` 部署）。
 
+## [1.7.0] - 2026-10-10
+
+- 精简多 worker 冲突检查：去掉运行中的一层（每 5 秒的认领轮询、`foreign.json`、插件对别的 worker 文件的拦截、守护进程里的归属判断）。上线后真实运行中零命中，却带来持续开销和弹窗事故。
+- 派单和 `piw scope add` 时的重叠检查降级为提示，不再拒绝；同一检出并行也不再强制写「改」清单，没写时提示无法比对。分工由监工定。
+- 保留「不碰」写入拦截、`piw scope`、多名 `wait`。
+
 ## [1.6.1] - 2026-10-10
 
 - 修复 Windows 上反复弹出控制台窗口：守护进程脱离终端运行，调用 git/npm/taskkill 时未隐藏窗口，且并行冲突检查每 5 秒调用一次 git。子进程统一 `windowsHide`，检出目录查询按进程缓存。

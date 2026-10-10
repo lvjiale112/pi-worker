@@ -157,9 +157,10 @@ function scopeOf(dir) {
 	return readJson(path.join(dir, "scope.json"), null) ?? parseScope(fs.readFileSync(path.join(dir, "brief.md"), "utf8"));
 }
 
-// ---------- 多 worker 冲突 ----------
+// ---------- 并行重叠提示 ----------
 
-// 同一检出（同一 git 根目录）里的 worker 共用文件，同一文件只能有一个写入者；worktree 是另一个检出，互不冲突。
+// 同一检出（同一 git 根目录）里的 worker 共用文件；派单和扩范围时提示与在跑 worker 的重叠，由监工决定怎么分工。
+// worktree 是另一个检出，不比较。
 const norm = (p) => (WIN ? p.toLowerCase() : p);
 const checkouts = new Map();
 function checkoutOf(cwd) {
@@ -214,14 +215,19 @@ function overlaps(a, b) {
 	return lit(a).startsWith(lit(b)) || lit(b).startsWith(lit(a));
 }
 
-function conflicts(name, checkout, change) {
-	const clashes = [];
-	for (const o of otherClaims(name, checkout))
-		for (const e of change) {
+function overlapNotes(name, meta, change) {
+	const others = otherClaims(name, meta.checkout);
+	if (!others.length) return [];
+	const names = others.map((o) => o.name).join("、");
+	const mine = change.map((p) => toCheckout(meta, p)).filter(Boolean);
+	if (!mine.length) return [`同一检出里还有 ${names} 在跑；本单没写「改」清单，无法比对重叠`];
+	const notes = [];
+	for (const o of others)
+		for (const e of mine) {
 			const hit = new Set([...o.change.filter((c) => overlaps(e, c)), ...o.files.filter((f) => matches(f, e))]);
-			if (hit.size) clashes.push(`${e} ↔ ${o.name}：${[...hit].join(", ")}`);
+			if (hit.size) notes.push(`⚠ ${e} 与 ${o.name} 重叠：${[...hit].join(", ")}`);
 		}
-	return clashes;
+	return notes.length ? [...notes, "同一文件同时只该有一个写入者：调整分工、加 --worktree，或者等对方收工"] : [`与 ${names} 同一检出，「改」清单无重叠`];
 }
 
 // ---------- pi 定位与启动参数 ----------
@@ -287,16 +293,6 @@ async function daemon(name) {
 	const dir = runDir(name);
 	const meta = readJson(path.join(dir, "meta.json"));
 	const brief = fs.readFileSync(path.join(dir, "brief.md"), "utf8");
-	meta.checkout ??= checkoutOf(meta.cwd);
-	const ownerOf = (f) => {
-		const top = toCheckout(meta, f);
-		return top && otherClaims(name, meta.checkout).find((o) => o.change.some((e) => matches(top, e)) || o.files.includes(top))?.name;
-	};
-	// 其他在跑 worker 认领的路径写给 worker-ext，由它在写入前拦截
-	const writeForeign = () =>
-		writeJson(path.join(dir, "foreign.json"), { checkout: meta.checkout, workers: otherClaims(name, meta.checkout) });
-	writeForeign();
-	const foreignTimer = setInterval(writeForeign, 5000);
 	const eventsFile = path.join(dir, "events.jsonl");
 	const inbox = path.join(dir, "inbox");
 	const resumeFile = path.join(dir, "resume.md");
@@ -432,10 +428,9 @@ async function daemon(name) {
 				emit({ kind: "tool", tool: rec.toolName, text: toolSummary(rec.toolName, rec.args) });
 				if (CHANGE_TOOLS.has(rec.toolName)) {
 					const f = rel(rec.args?.path);
-					const owner = ownerOf(f);
-					const problem = owner ? `在跑的 worker ${owner} 负责这个文件` : scopeProblem(f, scopeOf(dir));
-					// 这两类写入由 worker-ext 拦下，不算本 worker 改过的文件
-					const blocked = Boolean(owner) || Boolean(problem?.includes("不碰"));
+					const problem = scopeProblem(f, scopeOf(dir));
+					// 「不碰」的写入由 worker-ext 拦下，不算本 worker 改过的文件
+					const blocked = Boolean(problem?.includes("不碰"));
 					if (!blocked && !st.files.includes(f)) st.files.push(f);
 					if (problem && !st.flagged.includes(f)) {
 						st.flagged.push(f);
@@ -524,7 +519,6 @@ async function daemon(name) {
 	let poll;
 	child.on("exit", (code, signal) => {
 		clearInterval(poll);
-		clearInterval(foreignTimer);
 		st.state = "exited";
 		emit({ kind: "exit", text: `pi 退出（code=${code}${signal ? `, ${signal}` : ""}）` });
 		process.exit(0);
@@ -679,15 +673,7 @@ async function cmdStart(name, opt) {
 	let worktree = null;
 	const checkout = checkoutOf(cwd);
 	const mine = parseScope(fs.readFileSync(path.resolve(opt.brief), "utf8"));
-	const rivals = opt.worktree ? [] : otherClaims(name, checkout);
-	if (rivals.length) {
-		const names = rivals.map((o) => o.name).join("、");
-		const change = mine.change.map((p) => toCheckout({ cwd, checkout }, p)).filter(Boolean);
-		if (!change.length) die(`这个检出里还有 worker 在跑（${names}）；并行施工的施工单必须写「改：」清单，或者加 --worktree`);
-		const clashes = conflicts(name, checkout, change);
-		if (clashes.length)
-			die(`「改」清单和在跑的 worker 冲突（同一文件只能有一个写入者）：\n  ${clashes.join("\n  ")}\n改施工单避开这些路径，或者加 --worktree`);
-	}
+	const overlap = opt.worktree ? [] : overlapNotes(name, { cwd, checkout }, mine.change);
 	if (opt.worktree) ({ cwd, worktree } = makeWorktree(cwd, name));
 	fs.mkdirSync(path.join(dir, "inbox"), { recursive: true });
 	const meta = {
@@ -724,7 +710,7 @@ ${brief}`);
 	console.log(`安全扩展：${meta.extensions.join(", ") || "未安装"}`);
 	if (opt.adopt) console.log(`接管会话：${path.resolve(opt.adopt)}`);
 	console.log(`越界检查：改 [${scope.change.join(", ") || "未写，不检查"}]；不碰 [${scope.keepOut.join(", ") || "无"}]`);
-	if (rivals.length) console.log(`并行：与 ${rivals.map((o) => o.name).join("、")} 同一检出，「改」清单无交叉`);
+	for (const n of overlap) console.log(`并行：${n}`);
 	if (worktree) console.log(`worktree：${worktree.path}（分支 ${worktree.branch}，基于 ${worktree.base.slice(0, 8)}）`);
 	console.log(headline(dir).join("\n"));
 	fs.writeFileSync(path.join(dir, "cursor"), String(status(dir).seq ?? 0));
@@ -803,14 +789,13 @@ function cmdScope(name, [action, ...paths]) {
 		if (key === "change") {
 			const meta = readJson(path.join(dir, "meta.json"));
 			meta.checkout ??= checkoutOf(meta.cwd);
-			const clashes = conflicts(name, meta.checkout, clean.map((p) => toCheckout(meta, p)).filter(Boolean));
-			if (clashes.length) die(`和在跑的 worker 冲突（同一文件只能有一个写入者）：\n  ${clashes.join("\n  ")}`);
+			for (const n of overlapNotes(name, meta, clean)) if (n.startsWith("⚠") || n.startsWith("同一文件")) console.log(`并行：${n}`);
 		}
 		scope[key] = [...new Set([...scope[key], ...clean])];
 		writeJson(path.join(dir, "scope.json"), scope);
 	}
 	console.log(`改 [${scope.change.join(", ") || "未写，不检查"}]\n不碰 [${scope.keepOut.join(", ") || "无"}]`);
-	if (action) console.log("范围已更新：越界检查、写入拦截和并行冲突检查即时生效。要让 pi 知道，再 send 一句说明。");
+	if (action) console.log("范围已更新：越界检查和「不碰」写入拦截即时生效。要让 pi 知道，再 send 一句说明。");
 }
 
 async function cmdSend(name, opt, text) {
