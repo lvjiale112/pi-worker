@@ -22,8 +22,6 @@ const MAX_RETRIES = 3;
 const TRANSIENT = /overload|rate.?limit|429|5\d\d|timeout|timed out|ECONN|ETIMEDOUT|socket|network|fetch failed|terminated|stream/i;
 const COMPACT_INSTRUCTIONS =
 	"保留：施工单的目标、范围与阶段划分；已完成的里程碑及其汇报；改过的文件清单；监工的全部插话与纠正；当前进行中的步骤、已知问题和下一步。";
-// wait 在这些事件上返回：阶段性成果和必须由监工处理的信号。
-const WAKE = new Set(["milestone", "report", "scope", "settled", "exit"]);
 
 // ---------- 通用 ----------
 
@@ -343,6 +341,7 @@ async function daemon(name) {
 				break;
 			case "tool_execution_start":
 				st.toolCalls++;
+				st.activeTool = rec.toolName;
 				emit({ kind: "tool", tool: rec.toolName, text: toolSummary(rec.toolName, rec.args) });
 				if (CHANGE_TOOLS.has(rec.toolName)) {
 					const f = rel(rec.args?.path);
@@ -350,11 +349,13 @@ async function daemon(name) {
 					const problem = scopeProblem(f, scope);
 					if (problem && !st.flagged.includes(f)) {
 						st.flagged.push(f);
-						emit({ kind: "scope", text: `${f}（${problem}）` });
+						emit({ kind: "scope", hard: problem.includes("不碰"), text: `${f}（${problem}）` });
 					}
 				}
 				break;
 			case "tool_execution_end":
+				st.activeTool = null;
+				save();
 				if (rec.isError) emit({ kind: "tool_error", tool: rec.toolName, text: tail(resultText(rec.result), 600) });
 				else if (SHELL_TOOLS.has(rec.toolName)) emit({ kind: "output", tool: rec.toolName, text: tail(resultText(rec.result), 400) });
 				break;
@@ -518,7 +519,7 @@ function results(dir, reason, upto = Infinity) {
 	const changed = [...new Set(events.filter((e) => e.kind === "tool" && CHANGE_TOOLS.has(e.tool)).map((e) => e.text.replace(/（.*$/, "")))];
 	const out = [`【${reason}】`, ...headline(dir)];
 	if (changed.length) out.push(`本段改动：${changed.join(", ")}`);
-	for (const e of events.filter((e) => e.kind === "scope")) out.push(`⚠ 越界：${e.text}`);
+	for (const e of events.filter((e) => e.kind === "scope")) out.push(`⚠ ${e.hard === false ? "越出「改」清单" : "越界"}：${e.text}`);
 	for (const e of events.filter((e) => e.kind === "error" || e.kind === "note")) out.push(`${e.kind === "error" ? "错误" : "注"}：${e.text}`);
 	const reports = events.filter((e) => e.kind === "milestone" || e.kind === "report");
 	const lastSay = [...events].reverse().find((e) => ["say", "milestone", "report"].includes(e.kind));
@@ -640,12 +641,18 @@ async function cmdResume(name, opt, text) {
 
 async function cmdWait(name, opt) {
 	const dir = requireRun(name);
-	const deadline = Date.now() + Number(opt.timeout ?? 1500) * 1000;
+	const started = Date.now();
+	const deadline = opt.timeout ? started + Number(opt.timeout) * 1000 : Infinity;
+	const stallMs = Number(opt.stall ?? 30) * 60000;
 	const from = cursorOf(dir);
+	const wakes = (e) => e.kind === "settled" || e.kind === "exit" || e.kind === "report"
+		|| (e.kind === "scope" && (e.hard !== false || opt.milestones))
+		|| (e.kind === "milestone" && opt.milestones);
 	let reason = "超时，仍在施工";
 	let upto = Infinity;
 	while (Date.now() < deadline) {
-		const hit = readEvents(dir).filter((e) => e.seq > from && WAKE.has(e.kind));
+		const events = readEvents(dir);
+		const hit = events.filter((e) => e.seq > from && wakes(e));
 		const st = status(dir);
 		if (hit.length || st.state === "exited") {
 			const kinds = new Set(hit.map((e) => e.kind));
@@ -658,7 +665,14 @@ async function cmdWait(name, opt) {
 				: "里程碑";
 			break;
 		}
-		await sleep(1000);
+		// 没有定时空醒；只有长时间没有任何动静才叫醒（有命令在跑时放宽三倍，给整库测试留时间）
+		const last = Math.max(started, Date.parse(events.at(-1)?.t ?? 0), Date.parse(st.updated ?? 0));
+		const limit = st.activeTool ? stallMs * 3 : stallMs;
+		if (st.state === "running" && Date.now() - last > limit) {
+			reason = `疑似卡住：${Math.round((Date.now() - last) / 60000)} 分钟没有动静${st.activeTool ? `（${st.activeTool} 仍在执行）` : ""}`;
+			break;
+		}
+		await sleep(2000);
 	}
 	console.log(results(dir, reason, upto));
 }
@@ -714,7 +728,8 @@ const [cmd, ...rest] = process.argv.slice(2);
 const { pos, opt } = parseArgs(rest);
 const USAGE = `用法：
   piw start  <名> --brief <施工单.md> [--cwd 目录] [--worktree] [--adopt 会话.jsonl] [--model p/id] [--thinking 级别] [--no-fast]
-  piw wait   <名> [--timeout 秒=1500]       里程碑 / 完成汇报 / 停下 / 越界 / 退出 时返回阶段性成果
+  piw wait   <名> [--milestones] [--stall 分钟=30] [--timeout 秒]
+             完成汇报 / 停下 / 碰「不碰」/ 退出 / 疑似卡住 时返回，里程碑攒到返回时一起给；--milestones 逐段返回
   piw log    <名> [--since 序号]            过程明细（默认最近 80 条）
   piw send   <名> "消息" | --file 文件      运行中插话，停下时派发新一轮
   piw abort  <名>
