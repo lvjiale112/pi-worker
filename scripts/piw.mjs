@@ -20,7 +20,8 @@ const CHANGE_TOOLS = new Set(["edit", "write"]);
 const REPORT_TOOLS = { stage_report: "milestone", final_report: "report", ask_supervisor: "ask" };
 // 用户的 pi 全局设置关掉了自动压缩和重试，RPC 开关又会写回全局设置，所以这两件事由 piw 自己做。
 const COMPACT_AT = 0.7;
-const MAX_RETRIES = 3;
+// 退避按代理或网络断一阵来定：30s、1m、2m、4m，合计能扛约 8 分钟
+const RETRY_DELAYS = [30, 60, 120, 240];
 const TRANSIENT = /overload|rate.?limit|429|5\d\d|timeout|timed out|ECONN|ETIMEDOUT|socket|network|fetch failed|terminated|stream/i;
 const COMPACT_INSTRUCTIONS =
 	"保留：施工单的目标、范围与阶段划分；已完成的里程碑及其汇报；改过的文件清单；监工的全部插话与纠正；当前进行中的步骤、已知问题和下一步。";
@@ -400,6 +401,8 @@ async function daemon(name) {
 	// 重试：服务端或网络的瞬时错误，在原会话里接着干。
 	let retries = 0;
 	let lastError = null;
+	// pi 交了完工汇报或请示，这一轮就此结束；此时压缩会附上施工单把它重新叫起来，留到下一轮再压
+	let stopping = false;
 
 	const onRecord = (rec) => {
 		if (rec.type === "response") {
@@ -413,6 +416,7 @@ async function daemon(name) {
 		}
 		switch (rec.type) {
 			case "agent_start":
+				stopping = false;
 				st.state = "running";
 				save();
 				break;
@@ -420,7 +424,7 @@ async function daemon(name) {
 				st.turns++;
 				break;
 			case "turn_end":
-				if (!compacting && st.contextWindow && st.contextTokens / st.contextWindow >= COMPACT_AT) compact();
+				if (!compacting && !stopping && st.contextWindow && st.contextTokens / st.contextWindow >= COMPACT_AT) compact();
 				break;
 			case "tool_execution_start":
 				st.toolCalls++;
@@ -442,6 +446,7 @@ async function daemon(name) {
 				st.activeTool = null;
 				save();
 				if (REPORT_TOOLS[rec.toolName] && !rec.isError) {
+					if (rec.toolName !== "stage_report") stopping = true;
 					emit({ kind: REPORT_TOOLS[rec.toolName], text: rec.result?.details?.markdown ?? resultText(rec.result) });
 					break;
 				}
@@ -484,12 +489,13 @@ async function daemon(name) {
 				break;
 			case "agent_settled":
 				if (compacting) break;
-				if (lastError && TRANSIENT.test(lastError) && retries < MAX_RETRIES) {
+				if (lastError && TRANSIENT.test(lastError) && retries < RETRY_DELAYS.length) {
 					retries++;
 					const err = lastError;
 					lastError = null;
-					emit({ kind: "note", text: `出错，${5 * retries} 秒后重试 ${retries}/${MAX_RETRIES}：${clip(err, 200)}` });
-					setTimeout(() => prompt("上一步因服务或网络错误中断。检查已完成到哪里，然后继续施工。"), 5000 * retries);
+					const delay = RETRY_DELAYS[retries - 1];
+					emit({ kind: "note", text: `出错，${delay} 秒后重试 ${retries}/${RETRY_DELAYS.length}：${clip(err, 200)}` });
+					setTimeout(() => prompt("上一步因服务或网络错误中断。检查已完成到哪里，然后继续施工。"), delay * 1000);
 					break;
 				}
 				if (lastError) emit({ kind: "error", text: lastError });
@@ -703,6 +709,8 @@ ${brief}`);
 	}
 	const scope = mine;
 	writeJson(path.join(dir, "scope.json"), scope);
+	// 已读位置从开工前算起：pi 在 start 返回前就交的汇报或请示，第一次 wait 也能收到
+	fs.writeFileSync(path.join(dir, "cursor"), "0");
 	spawnDaemon(dir, name, cwd);
 	await waitStarted(dir);
 	console.log(`已派单 ${name}：${meta.model}:${meta.thinking}${meta.fast ? " fast" : ""}`);
@@ -713,7 +721,6 @@ ${brief}`);
 	for (const n of overlap) console.log(`并行：${n}`);
 	if (worktree) console.log(`worktree：${worktree.path}（分支 ${worktree.branch}，基于 ${worktree.base.slice(0, 8)}）`);
 	console.log(headline(dir).join("\n"));
-	fs.writeFileSync(path.join(dir, "cursor"), String(status(dir).seq ?? 0));
 }
 
 async function cmdResume(name, opt, text) {
