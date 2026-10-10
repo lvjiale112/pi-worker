@@ -160,6 +160,17 @@ function piCli() {
 	return path.join(pkgDir, typeof pkg.bin === "string" ? pkg.bin : pkg.bin.pi);
 }
 
+// -ne 关掉了用户的全部扩展；安全底线扩展（危险命令、敏感文件一律拦截，无人值守时 ask 即拒绝）装了就单独加回来。
+const SAFETY_PACKAGES = ["@yen/pi-auto-mode"];
+function safetyExtensions() {
+	const agentDir = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
+	return SAFETY_PACKAGES.flatMap((name) => {
+		const dir = path.join(agentDir, "npm", "node_modules", ...name.split("/"));
+		const pkg = readJson(path.join(dir, "package.json"), null);
+		return (pkg?.pi?.extensions ?? []).map((e) => path.join(dir, e));
+	});
+}
+
 // -nc 关掉了 pi 自带的上下文文件发现（含 ~/.pi/agent 的全局说明），这里只补回项目链上的说明。
 function projectContextFiles(cwd) {
 	const found = [];
@@ -186,6 +197,7 @@ function piArgs(meta, sessionFile) {
 		"--thinking", meta.thinking,
 		"--tools", `read,${shell},edit,write,grep,find,ls`,
 		"-e", path.join(HERE, "worker-ext.ts"),
+		...(meta.extensions ?? []).flatMap((e) => ["-e", e]),
 		"--append-system-prompt", path.join(SKILL, "references", "worker-rules.md"),
 	];
 	for (const f of meta.contextFiles) args.push("--append-system-prompt", f);
@@ -581,15 +593,28 @@ async function cmdStart(name, opt) {
 		thinking: opt.thinking ?? DEFAULTS.thinking,
 		fast: opt["no-fast"] ? false : DEFAULTS.fast,
 		contextFiles: projectContextFiles(cwd),
+		extensions: safetyExtensions(),
 		started: new Date().toISOString(),
 	};
 	fs.copyFileSync(path.resolve(opt.brief), path.join(dir, "brief.md"));
 	writeJson(path.join(dir, "meta.json"), meta);
+	if (opt.adopt) {
+		// 接管别处跑过的 pi 会话：沿用它的上下文，以施工单为准继续
+		const sessionFile = path.resolve(opt.adopt);
+		if (!fs.existsSync(sessionFile)) die(`找不到会话文件：${sessionFile}`);
+		writeJson(path.join(dir, "status.json"), { state: "starting", sessionFile });
+		const brief = fs.readFileSync(path.join(dir, "brief.md"), "utf8");
+		fs.writeFileSync(path.join(dir, "resume.md"), `（监工接管了这个会话：之前的进程已停止，此后经由监工沟通。以下施工单为准；先核对之前做到哪一步，再继续。）
+
+${brief}`);
+	}
 	const scope = parseScope(fs.readFileSync(path.join(dir, "brief.md"), "utf8"));
 	spawnDaemon(dir, name, cwd);
 	await waitStarted(dir);
 	console.log(`已派单 ${name}：${meta.model}:${meta.thinking}${meta.fast ? " fast" : ""}`);
 	console.log(`项目说明：${meta.contextFiles.join(", ") || "无"}`);
+	console.log(`安全扩展：${meta.extensions.join(", ") || "未安装"}`);
+	if (opt.adopt) console.log(`接管会话：${path.resolve(opt.adopt)}`);
 	console.log(`越界检查：改 [${scope.change.join(", ") || "未写，不检查"}]；不碰 [${scope.keepOut.join(", ") || "无"}]`);
 	if (worktree) console.log(`worktree：${worktree.path}（分支 ${worktree.branch}，基于 ${worktree.base.slice(0, 8)}）`);
 	console.log(headline(dir).join("\n"));
@@ -688,7 +713,7 @@ function cmdList() {
 const [cmd, ...rest] = process.argv.slice(2);
 const { pos, opt } = parseArgs(rest);
 const USAGE = `用法：
-  piw start  <名> --brief <施工单.md> [--cwd 目录] [--worktree] [--model p/id] [--thinking 级别] [--no-fast]
+  piw start  <名> --brief <施工单.md> [--cwd 目录] [--worktree] [--adopt 会话.jsonl] [--model p/id] [--thinking 级别] [--no-fast]
   piw wait   <名> [--timeout 秒=1500]       里程碑 / 完成汇报 / 停下 / 越界 / 退出 时返回阶段性成果
   piw log    <名> [--since 序号]            过程明细（默认最近 80 条）
   piw send   <名> "消息" | --file 文件      运行中插话，停下时派发新一轮

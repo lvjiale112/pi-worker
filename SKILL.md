@@ -2,7 +2,7 @@
 name: pi-worker
 description: 把已定方案交给本机 pi agent 施工并全程监工：写施工单、派单、往来通信、中途纠偏、验收。用户要求用 pi 施工、派活给 pi / 施工子代理、让 pi 写代码时使用。
 metadata:
-  version: 1.1.0
+  version: 1.2.0
 ---
 
 # pi 施工监工
@@ -65,7 +65,7 @@ node "$HOME/.claude/skills/pi-worker/scripts/piw.mjs" <命令> ...
 piw start <名> --brief <施工单.md> --cwd <项目目录> [--worktree]
 ```
 
-可选 `--model provider/id`、`--thinking 级别`、`--no-fast`；用户没指定就用默认。输出会列出 pi 看到的项目说明（只有 cwd 往上到 git 根的 `AGENTS.md`/`CLAUDE.md`，不加载 `~/.pi/agent` 的全局说明、扩展和技能）和解析出的越界清单；清单不对就 `stop` 改施工单重派。
+可选 `--model provider/id`、`--thinking 级别`、`--no-fast`；用户没指定就用默认。接手别处起的 pi 会话（例如另一个会话用 `pi -p` 起的施工）时加 `--adopt <会话.jsonl>`：先确认原进程已结束，piw 沿用那个会话的上下文，并把施工单作为接管指示发给它。输出会列出 pi 看到的项目说明（只有 cwd 往上到 git 根的 `AGENTS.md`/`CLAUDE.md`，不加载 `~/.pi/agent` 的全局说明、扩展和技能）和解析出的越界清单；清单不对就 `stop` 改施工单重派。
 
 并行派多个 worker 时，各自用 `--worktree`，或者保证「改」清单互不相交。
 
@@ -117,6 +117,6 @@ pi 完成汇报后做一次完整审查：
 
 ## 运行环境
 
-- pi 以 RPC 模式常驻后台，没有权限弹窗：它在 cwd 内能执行任意 shell 命令和读写文件，唯一的硬拦截是 git 写操作（[worker-ext.ts](scripts/worker-ext.ts)，会误拦 `git stash list` 这类只读命令）。扩展弹出的对话框一律自动取消。
+- pi 以 RPC 模式常驻后台，没有权限弹窗。用户的扩展一律不加载，只加回两样：[worker-ext.ts](scripts/worker-ext.ts)（拦截 git 写操作，会误拦 `git stash list` 这类只读命令）；装了 `@yen/pi-auto-mode` 时加载它作安全底线（危险命令、敏感文件、`.env` 写入拦截，需确认的操作在无人值守时直接拒绝）。start 输出会列出加载了哪些。扩展弹出的对话框一律自动取消。
 - 自动压缩和重试由 piw 实现，不改 `~/.pi/agent/settings.json`（pi 的同名 RPC 开关会写回全局设置）。
 - worker 退出后运行目录保留；`piw list` 列出全部。同名 `start` 会覆盖已退出的旧目录。
