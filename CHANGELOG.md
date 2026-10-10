@@ -4,6 +4,13 @@
 版本号声明在 `SKILL.md` 的 frontmatter `metadata.version`（锁内受管，
 `skillset update pi-worker --apply` 落锁后 `sync` 部署）。
 
+## [1.4.0] - 2026-10-10
+
+- 多 worker 冲突检查：同一检出并行时，施工单必须写「改：」清单；派单时与在跑 worker 的「改」清单和已改文件比对，有交叉就拒绝派出（`--worktree` 不受限）。
+- 施工中的跨 worker 写入拦截：piw 把其他 worker 认领的路径写入运行目录的 `foreign.json`，worker-ext 在 edit/write 前拦截，并作为越界叫醒监工。
+- `wait` 可同时等多个 worker，哪个先有结果返回哪个。
+- SKILL 新增「并行派多个」。
+
 ## [1.3.0] - 2026-10-10
 
 - 长程施工、少交接：`wait` 默认只在完成汇报、停下提问、碰「不碰」清单、进程退出、疑似卡住时返回，里程碑汇报和越出「改」清单累积到返回时一起给；`--milestones` 恢复逐段返回。

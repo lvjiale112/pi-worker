@@ -147,6 +147,67 @@ function scopeProblem(rel, scope) {
 	return null;
 }
 
+// ---------- 多 worker 冲突 ----------
+
+// 同一检出（同一 git 根目录）里的 worker 共用文件，同一文件只能有一个写入者；worktree 是另一个检出，互不冲突。
+const norm = (p) => (WIN ? p.toLowerCase() : p);
+function checkoutOf(cwd) {
+	try {
+		return norm(path.resolve(git(cwd, "rev-parse", "--show-toplevel")));
+	} catch {
+		return norm(path.resolve(cwd));
+	}
+}
+
+// 相对 cwd 的路径或模式 → 相对检出根目录；cwd 之外的绝对路径不参与比较
+function toCheckout(meta, p) {
+	if (path.isAbsolute(p)) return null;
+	const sub = path.relative(meta.checkout, norm(path.resolve(meta.cwd))).replaceAll("\\", "/");
+	return norm(sub ? `${sub}/${p}` : p);
+}
+
+// 在跑的 worker 认领的路径：施工单「改」清单 + 已经改过的文件
+function claimsOf(dir) {
+	const meta = readJson(path.join(dir, "meta.json"), null);
+	if (!meta || status(dir).state === "exited") return null;
+	meta.checkout ??= checkoutOf(meta.cwd);
+	const up = (p) => toCheckout(meta, p);
+	const scope = parseScope(fs.readFileSync(path.join(dir, "brief.md"), "utf8"));
+	return {
+		name: meta.name,
+		checkout: meta.checkout,
+		change: scope.change.map(up).filter(Boolean),
+		files: (status(dir).files ?? []).map(up).filter(Boolean),
+	};
+}
+
+function otherClaims(self, checkout) {
+	if (!fs.existsSync(RUNS)) return [];
+	return fs
+		.readdirSync(RUNS)
+		.filter((n) => n !== self)
+		.map((n) => claimsOf(runDir(n)))
+		.filter((c) => c && c.checkout === checkout);
+}
+
+// 两个路径模式是否可能指向同一文件（两边都带通配时按字面前缀保守判断）
+function overlaps(a, b) {
+	const lit = (p) => (p.includes("*") ? p.slice(0, p.indexOf("*")) : p);
+	if (!a.includes("*")) return matches(a, b) || (!b.includes("*") && matches(b, a));
+	if (!b.includes("*")) return matches(b, a);
+	return lit(a).startsWith(lit(b)) || lit(b).startsWith(lit(a));
+}
+
+function conflicts(name, checkout, change) {
+	const clashes = [];
+	for (const o of otherClaims(name, checkout))
+		for (const e of change) {
+			const hit = new Set([...o.change.filter((c) => overlaps(e, c)), ...o.files.filter((f) => matches(f, e))]);
+			if (hit.size) clashes.push(`${e} ↔ ${o.name}：${[...hit].join(", ")}`);
+		}
+	return clashes;
+}
+
 // ---------- pi 定位与启动参数 ----------
 
 function piCli() {
@@ -211,6 +272,16 @@ async function daemon(name) {
 	const meta = readJson(path.join(dir, "meta.json"));
 	const brief = fs.readFileSync(path.join(dir, "brief.md"), "utf8");
 	const scope = parseScope(brief);
+	meta.checkout ??= checkoutOf(meta.cwd);
+	const ownerOf = (f) => {
+		const top = toCheckout(meta, f);
+		return top && otherClaims(name, meta.checkout).find((o) => o.change.some((e) => matches(top, e)) || o.files.includes(top))?.name;
+	};
+	// 其他在跑 worker 认领的路径写给 worker-ext，由它在写入前拦截
+	const writeForeign = () =>
+		writeJson(path.join(dir, "foreign.json"), { checkout: meta.checkout, workers: otherClaims(name, meta.checkout) });
+	writeForeign();
+	const foreignTimer = setInterval(writeForeign, 5000);
 	const eventsFile = path.join(dir, "events.jsonl");
 	const inbox = path.join(dir, "inbox");
 	const resumeFile = path.join(dir, "resume.md");
@@ -244,6 +315,7 @@ async function daemon(name) {
 
 	const child = spawn(process.execPath, [piCli(), ...piArgs(meta, resuming ? st.sessionFile : null)], {
 		cwd: meta.cwd,
+		env: { ...process.env, PIW_RUN_DIR: dir },
 		stdio: ["pipe", "pipe", "pipe"],
 		windowsHide: true,
 	});
@@ -345,11 +417,12 @@ async function daemon(name) {
 				emit({ kind: "tool", tool: rec.toolName, text: toolSummary(rec.toolName, rec.args) });
 				if (CHANGE_TOOLS.has(rec.toolName)) {
 					const f = rel(rec.args?.path);
-					if (!st.files.includes(f)) st.files.push(f);
-					const problem = scopeProblem(f, scope);
+					const owner = ownerOf(f);
+					if (!owner && !st.files.includes(f)) st.files.push(f);
+					const problem = owner ? `在跑的 worker ${owner} 负责这个文件，写入已拦截` : scopeProblem(f, scope);
 					if (problem && !st.flagged.includes(f)) {
 						st.flagged.push(f);
-						emit({ kind: "scope", hard: problem.includes("不碰"), text: `${f}（${problem}）` });
+						emit({ kind: "scope", hard: Boolean(owner) || problem.includes("不碰"), text: `${f}（${problem}）` });
 					}
 				}
 				break;
@@ -431,6 +504,7 @@ async function daemon(name) {
 	let poll;
 	child.on("exit", (code, signal) => {
 		clearInterval(poll);
+		clearInterval(foreignTimer);
 		st.state = "exited";
 		emit({ kind: "exit", text: `pi 退出（code=${code}${signal ? `, ${signal}` : ""}）` });
 		process.exit(0);
@@ -583,12 +657,24 @@ async function cmdStart(name, opt) {
 	}
 	let cwd = path.resolve(opt.cwd ?? process.cwd());
 	let worktree = null;
+	const checkout = checkoutOf(cwd);
+	const mine = parseScope(fs.readFileSync(path.resolve(opt.brief), "utf8"));
+	const rivals = opt.worktree ? [] : otherClaims(name, checkout);
+	if (rivals.length) {
+		const names = rivals.map((o) => o.name).join("、");
+		const change = mine.change.map((p) => toCheckout({ cwd, checkout }, p)).filter(Boolean);
+		if (!change.length) die(`这个检出里还有 worker 在跑（${names}）；并行施工的施工单必须写「改：」清单，或者加 --worktree`);
+		const clashes = conflicts(name, checkout, change);
+		if (clashes.length)
+			die(`「改」清单和在跑的 worker 冲突（同一文件只能有一个写入者）：\n  ${clashes.join("\n  ")}\n改施工单避开这些路径，或者加 --worktree`);
+	}
 	if (opt.worktree) ({ cwd, worktree } = makeWorktree(cwd, name));
 	fs.mkdirSync(path.join(dir, "inbox"), { recursive: true });
 	const meta = {
 		name,
 		dir,
 		cwd,
+		checkout: worktree ? checkoutOf(cwd) : checkout,
 		worktree,
 		model: opt.model ?? DEFAULTS.model,
 		thinking: opt.thinking ?? DEFAULTS.thinking,
@@ -617,6 +703,7 @@ ${brief}`);
 	console.log(`安全扩展：${meta.extensions.join(", ") || "未安装"}`);
 	if (opt.adopt) console.log(`接管会话：${path.resolve(opt.adopt)}`);
 	console.log(`越界检查：改 [${scope.change.join(", ") || "未写，不检查"}]；不碰 [${scope.keepOut.join(", ") || "无"}]`);
+	if (rivals.length) console.log(`并行：与 ${rivals.map((o) => o.name).join("、")} 同一检出，「改」清单无交叉`);
 	if (worktree) console.log(`worktree：${worktree.path}（分支 ${worktree.branch}，基于 ${worktree.base.slice(0, 8)}）`);
 	console.log(headline(dir).join("\n"));
 	fs.writeFileSync(path.join(dir, "cursor"), String(status(dir).seq ?? 0));
@@ -639,42 +726,47 @@ async function cmdResume(name, opt, text) {
 	console.log(headline(dir).join("\n"));
 }
 
-async function cmdWait(name, opt) {
-	const dir = requireRun(name);
+async function cmdWait(names, opt) {
+	if (!names.length) die("缺少 worker 名");
 	const started = Date.now();
 	const deadline = opt.timeout ? started + Number(opt.timeout) * 1000 : Infinity;
 	const stallMs = Number(opt.stall ?? 30) * 60000;
-	const from = cursorOf(dir);
 	const wakes = (e) => e.kind === "settled" || e.kind === "exit" || e.kind === "report"
 		|| (e.kind === "scope" && (e.hard !== false || opt.milestones))
 		|| (e.kind === "milestone" && opt.milestones);
-	let reason = "超时，仍在施工";
-	let upto = Infinity;
-	while (Date.now() < deadline) {
+	const watch = names.map((name) => {
+		const dir = requireRun(name);
+		return { dir, from: cursorOf(dir) };
+	});
+	const check = ({ dir, from }) => {
 		const events = readEvents(dir);
 		const hit = events.filter((e) => e.seq > from && wakes(e));
 		const st = status(dir);
 		if (hit.length || st.state === "exited") {
 			const kinds = new Set(hit.map((e) => e.kind));
-			// 截到最后一条触发事件，之后的动态留给下一次 wait
-			if (hit.length) upto = hit.at(-1).seq;
-			reason = kinds.has("exit") || st.state === "exited" ? "worker 已退出"
-				: kinds.has("report") ? "完成汇报"
-				: kinds.has("settled") ? "停下，等待指示"
-				: kinds.has("scope") ? "越界提醒"
-				: "里程碑";
-			break;
+			return {
+				// 截到最后一条触发事件，之后的动态留给下一次 wait
+				upto: hit.length ? hit.at(-1).seq : Infinity,
+				reason: kinds.has("exit") || st.state === "exited" ? "worker 已退出"
+					: kinds.has("report") ? "完成汇报"
+					: kinds.has("settled") ? "停下，等待指示"
+					: kinds.has("scope") ? "越界提醒"
+					: "里程碑",
+			};
 		}
 		// 没有定时空醒；只有长时间没有任何动静才叫醒（有命令在跑时放宽三倍，给整库测试留时间）
 		const last = Math.max(started, Date.parse(events.at(-1)?.t ?? 0), Date.parse(st.updated ?? 0));
 		const limit = st.activeTool ? stallMs * 3 : stallMs;
-		if (st.state === "running" && Date.now() - last > limit) {
-			reason = `疑似卡住：${Math.round((Date.now() - last) / 60000)} 分钟没有动静${st.activeTool ? `（${st.activeTool} 仍在执行）` : ""}`;
-			break;
-		}
+		if (st.state === "running" && Date.now() - last > limit)
+			return { reason: `疑似卡住：${Math.round((Date.now() - last) / 60000)} 分钟没有动静${st.activeTool ? `（${st.activeTool} 仍在执行）` : ""}` };
+		return null;
+	};
+	while (Date.now() < deadline) {
+		const done = watch.map((w) => [w, check(w)]).filter(([, r]) => r);
+		if (done.length) return console.log(done.map(([w, r]) => results(w.dir, r.reason, r.upto)).join("\n\n"));
 		await sleep(2000);
 	}
-	console.log(results(dir, reason, upto));
+	console.log(watch.map((w) => results(w.dir, "超时，仍在施工")).join("\n\n"));
 }
 
 async function cmdSend(name, opt, text) {
@@ -728,8 +820,9 @@ const [cmd, ...rest] = process.argv.slice(2);
 const { pos, opt } = parseArgs(rest);
 const USAGE = `用法：
   piw start  <名> --brief <施工单.md> [--cwd 目录] [--worktree] [--adopt 会话.jsonl] [--model p/id] [--thinking 级别] [--no-fast]
-  piw wait   <名> [--milestones] [--stall 分钟=30] [--timeout 秒]
-             完成汇报 / 停下 / 碰「不碰」/ 退出 / 疑似卡住 时返回，里程碑攒到返回时一起给；--milestones 逐段返回
+  piw wait   <名>... [--milestones] [--stall 分钟=30] [--timeout 秒]
+             完成汇报 / 停下 / 越界 / 退出 / 疑似卡住 时返回，里程碑攒到返回时一起给；--milestones 逐段返回
+             给多个名字时哪个先有结果就返回哪个
   piw log    <名> [--since 序号]            过程明细（默认最近 80 条）
   piw send   <名> "消息" | --file 文件      运行中插话，停下时派发新一轮
   piw abort  <名>
@@ -744,7 +837,7 @@ switch (cmd) {
 		await cmdStart(pos[0], opt);
 		break;
 	case "wait":
-		await cmdWait(pos[0], opt);
+		await cmdWait(pos, opt);
 		break;
 	case "log":
 		console.log(timeline(requireRun(pos[0]), opt.since === undefined ? undefined : Number(opt.since)));
