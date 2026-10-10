@@ -74,7 +74,9 @@ const tail = (s, n) => {
 	s = String(s ?? "").trim();
 	return s.length > n ? `…${s.slice(-n)}` : s;
 };
-const git = (cwd, ...args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+// 守护进程脱离终端运行，没有控制台；子进程不加 windowsHide 时 Windows 会给它新开一个控制台窗口
+const run = (cmd, args, opts = {}) => execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true, ...opts });
+const git = (cwd, ...args) => run("git", ["-C", cwd, ...args]).trim();
 
 function requireRun(name) {
 	if (!name) die("缺少 worker 名");
@@ -159,12 +161,18 @@ function scopeOf(dir) {
 
 // 同一检出（同一 git 根目录）里的 worker 共用文件，同一文件只能有一个写入者；worktree 是另一个检出，互不冲突。
 const norm = (p) => (WIN ? p.toLowerCase() : p);
+const checkouts = new Map();
 function checkoutOf(cwd) {
-	try {
-		return norm(path.resolve(git(cwd, "rev-parse", "--show-toplevel")));
-	} catch {
-		return norm(path.resolve(cwd));
+	if (!checkouts.has(cwd)) {
+		let top;
+		try {
+			top = norm(path.resolve(git(cwd, "rev-parse", "--show-toplevel")));
+		} catch {
+			top = norm(path.resolve(cwd));
+		}
+		checkouts.set(cwd, top);
 	}
+	return checkouts.get(cwd);
 }
 
 // 相对 cwd 的路径或模式 → 相对检出根目录；cwd 之外的绝对路径不参与比较
@@ -220,7 +228,7 @@ function conflicts(name, checkout, change) {
 
 function piCli() {
 	if (process.env.PIW_PI_CLI) return process.env.PIW_PI_CLI;
-	const root = execFileSync(WIN ? "npm.cmd" : "npm", ["root", "-g"], { encoding: "utf8", shell: WIN }).trim();
+	const root = run(WIN ? "npm.cmd" : "npm", ["root", "-g"], { shell: WIN }).trim();
 	const pkgDir = path.join(root, "@earendil-works", "pi-coding-agent");
 	const pkg = readJson(path.join(pkgDir, "package.json"), null);
 	if (!pkg) die(`找不到 pi 安装（${pkgDir}）；可用 PIW_PI_CLI 指向 cli.js`);
@@ -828,7 +836,7 @@ async function cmdStop(name, opt) {
 		if (opt.force) {
 			for (const pid of [st.piPid, st.daemonPid].filter(Boolean)) {
 				try {
-					if (WIN) execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
+					if (WIN) run("taskkill", ["/PID", String(pid), "/T", "/F"]);
 					else process.kill(pid, "SIGKILL");
 				} catch {}
 			}

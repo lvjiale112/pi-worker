@@ -2,7 +2,7 @@
 name: pi-worker
 description: 把已定方案交给本机 pi agent 施工并全程监工：写施工单、派单、往来通信、中途纠偏、验收。用户要求用 pi 施工、派活给 pi / 施工子代理、让 pi 写代码时使用。
 metadata:
-  version: 1.6.0
+  version: 1.6.1
 ---
 
 # pi 施工监工

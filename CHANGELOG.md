@@ -4,6 +4,10 @@
 版本号声明在 `SKILL.md` 的 frontmatter `metadata.version`（锁内受管，
 `skillset update pi-worker --apply` 落锁后 `sync` 部署）。
 
+## [1.6.1] - 2026-10-10
+
+- 修复 Windows 上反复弹出控制台窗口：守护进程脱离终端运行，调用 git/npm/taskkill 时未隐藏窗口，且并行冲突检查每 5 秒调用一次 git。子进程统一 `windowsHide`，检出目录查询按进程缓存。
+
 ## [1.6.0] - 2026-10-10
 
 - 派单写法放宽：施工单只写目标、做法、阶段、验收和真正需要的范围；git、别的 worker 的文件、施工纪律、安全底线、项目规矩由工具和已注入规则约束，不再写进施工单。「不碰」改为可选，只列工具不知道的硬限制；范围调整用 `piw scope`，不必重派。
