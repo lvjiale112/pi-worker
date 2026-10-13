@@ -1,0 +1,2 @@
+# Keep installed skill bytes identical to the reviewed source on every platform.
+skills/pi-worker/** -text

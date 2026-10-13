@@ -7,6 +7,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SKILL = path.dirname(HERE);
@@ -312,7 +313,7 @@ async function daemon(name) {
 		contextTokens: null,
 		contextWindow: null,
 		sessionFile: prev.sessionFile ?? null,
-		lastInbox: null,
+		outcome: resuming ? prev.outcome ?? null : null,
 		updated: new Date().toISOString(),
 	};
 	const save = () => {
@@ -327,7 +328,8 @@ async function daemon(name) {
 
 	const child = spawn(process.execPath, [piCli(), ...piArgs(meta, resuming ? st.sessionFile : null)], {
 		cwd: meta.cwd,
-		env: { ...process.env, PIW_RUN_DIR: dir },
+		// Windows 下 Python 写管道默认用 GBK，pi 按 UTF-8 读成乱码；统一让 Python 输出 UTF-8
+		env: { ...process.env, PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8", PIW_RUN_DIR: dir },
 		stdio: ["pipe", "pipe", "pipe"],
 		windowsHide: true,
 	});
@@ -342,11 +344,8 @@ async function daemon(name) {
 			pending.set(id, resolve);
 			child.stdin.write(`${JSON.stringify({ ...cmd, id })}\n`);
 		});
-	const prompt = async (message) => {
-		const r = await send({ type: "prompt", message });
-		if (r.success) st.state = "running";
-		return r;
-	};
+	// 运行状态由 agent_start / agent_settled 更新；接收确认可能晚于这些事件。
+	const prompt = (message) => send({ type: "prompt", message });
 
 	const rel = (p) => {
 		const abs = path.resolve(meta.cwd, String(p ?? ""));
@@ -380,27 +379,63 @@ async function daemon(name) {
 			.map((c) => c.text)
 			.join("\n");
 
-	// 压缩：中途压缩会先中断当前 run，压缩完再附上施工单原文让它接着干。
-	let compacting = false;
-	const compact = async () => {
-		compacting = true;
-		emit({ kind: "note", text: `上下文 ${Math.round((100 * st.contextTokens) / st.contextWindow)}%，压缩后继续` });
-		const r = await send({ type: "compact", customInstructions: COMPACT_INSTRUCTIONS });
-		st.contextTokens = null;
-		compacting = false;
-		if (!r.success) {
-			st.state = "idle";
-			emit({ kind: "error", text: `压缩失败：${r.error}` });
-			emit({ kind: "settled" });
-			return;
-		}
-		emit({ kind: "note", text: "压缩完成，继续施工" });
-		await prompt(`（上下文已压缩。以下是施工单原文；对照压缩摘要，从未完成的部分继续。）\n\n${brief}`);
-	};
-
 	// 重试：服务端或网络的瞬时错误，在原会话里接着干。
 	let retries = 0;
 	let lastError = null;
+	let retryTimer = null;
+	let controlEpoch = 0;
+	let autoPaused = false;
+	const cancelAutomatic = () => {
+		controlEpoch++;
+		autoPaused = true;
+		clearTimeout(retryTimer);
+		retryTimer = null;
+		retries = 0;
+		lastError = null;
+	};
+	const settled = () => {
+		st.state = "idle";
+		emit({ kind: "settled", outcome: st.outcome });
+	};
+	const retry = (error, attempt, action) => {
+		if (autoPaused || stopping || !TRANSIENT.test(error) || attempt >= RETRY_DELAYS.length) return false;
+		const epoch = controlEpoch;
+		const delay = RETRY_DELAYS[attempt];
+		st.state = "retrying";
+		emit({ kind: "note", text: `出错，${delay} 秒后重试 ${attempt + 1}/${RETRY_DELAYS.length}：${clip(error, 200)}` });
+		retryTimer = setTimeout(() => {
+			retryTimer = null;
+			if (epoch === controlEpoch && !autoPaused) action();
+		}, delay * 1000);
+		return true;
+	};
+	const continueWork = async (text) => {
+		const epoch = controlEpoch;
+		const r = await prompt(text);
+		if (!r.success && epoch === controlEpoch) settled();
+	};
+
+	// 压缩与普通请求共用退避；监工的新指令使旧压缩的续跑失效。
+	let compacting = false;
+	const compact = async (attempt = 0) => {
+		const epoch = controlEpoch;
+		compacting = true;
+		st.state = "compacting";
+		emit({ kind: "note", text: `上下文 ${Math.round((100 * st.contextTokens) / st.contextWindow)}%，压缩后继续` });
+		const r = await send({ type: "compact", customInstructions: COMPACT_INSTRUCTIONS });
+		compacting = false;
+		if (epoch !== controlEpoch || autoPaused) return;
+		if (!r.success) {
+			if (retry(r.error, attempt, () => compact(attempt + 1))) return;
+			emit({ kind: "error", text: `压缩失败：${r.error}` });
+			settled();
+			return;
+		}
+		st.contextTokens = null;
+		retries = 0;
+		emit({ kind: "note", text: "压缩完成，继续施工" });
+		await continueWork(`（上下文已压缩。以下是施工单原文；对照压缩摘要，从未完成的部分继续。）\n\n${brief}`);
+	};
 	// pi 交了完工汇报或请示，这一轮就此结束；此时压缩会附上施工单把它重新叫起来，留到下一轮再压
 	let stopping = false;
 
@@ -417,6 +452,7 @@ async function daemon(name) {
 		switch (rec.type) {
 			case "agent_start":
 				stopping = false;
+				st.outcome = null;
 				st.state = "running";
 				save();
 				break;
@@ -424,7 +460,7 @@ async function daemon(name) {
 				st.turns++;
 				break;
 			case "turn_end":
-				if (!compacting && !stopping && st.contextWindow && st.contextTokens / st.contextWindow >= COMPACT_AT) compact();
+				if (!autoPaused && !retryTimer && !compacting && !stopping && st.contextWindow && st.contextTokens / st.contextWindow >= COMPACT_AT) compact();
 				break;
 			case "tool_execution_start":
 				st.toolCalls++;
@@ -446,7 +482,12 @@ async function daemon(name) {
 				st.activeTool = null;
 				save();
 				if (REPORT_TOOLS[rec.toolName] && !rec.isError) {
-					if (rec.toolName !== "stage_report") stopping = true;
+					if (rec.toolName !== "stage_report") {
+						stopping = true;
+						st.outcome = REPORT_TOOLS[rec.toolName];
+						clearTimeout(retryTimer);
+						retryTimer = null;
+					}
 					emit({ kind: REPORT_TOOLS[rec.toolName], text: rec.result?.details?.markdown ?? resultText(rec.result) });
 					break;
 				}
@@ -488,20 +529,15 @@ async function daemon(name) {
 				}
 				break;
 			case "agent_settled":
-				if (compacting) break;
-				if (lastError && TRANSIENT.test(lastError) && retries < RETRY_DELAYS.length) {
+				if (compacting || retryTimer) break;
+				if (lastError && retry(lastError, retries, () => continueWork("上一步因服务或网络错误中断。检查已完成到哪里，然后继续施工。"))) {
 					retries++;
-					const err = lastError;
 					lastError = null;
-					const delay = RETRY_DELAYS[retries - 1];
-					emit({ kind: "note", text: `出错，${delay} 秒后重试 ${retries}/${RETRY_DELAYS.length}：${clip(err, 200)}` });
-					setTimeout(() => prompt("上一步因服务或网络错误中断。检查已完成到哪里，然后继续施工。"), delay * 1000);
 					break;
 				}
 				if (lastError) emit({ kind: "error", text: lastError });
 				lastError = null;
-				st.state = "idle";
-				emit({ kind: "settled" });
+				settled();
 				break;
 		}
 	};
@@ -525,6 +561,7 @@ async function daemon(name) {
 	let poll;
 	child.on("exit", (code, signal) => {
 		clearInterval(poll);
+		cancelAutomatic();
 		st.state = "exited";
 		emit({ kind: "exit", text: `pi 退出（code=${code}${signal ? `, ${signal}` : ""}）` });
 		process.exit(0);
@@ -532,40 +569,61 @@ async function daemon(name) {
 
 	// 监工的消息：运行中走 steer，空闲时开新一轮 prompt。
 	const handle = async (msg) => {
+		cancelAutomatic();
 		if (msg.type === "stop") {
-			emit({ kind: "boss", text: "收工" });
+			emit({ kind: "boss", text: "停止进程" });
 			child.stdin.end();
-			return;
+			return { success: true, action: "stop" };
 		}
 		if (msg.type === "abort") {
 			const r = await send({ type: "abort" });
 			emit({ kind: "boss", text: `中止${r.success ? "" : `失败：${r.error}`}` });
-			return;
+			if (r.success) settled();
+			return r;
 		}
 		const running = st.state === "running";
-		if (running) await send({ type: "steer", message: msg.text });
-		else await prompt(msg.text);
-		emit({ kind: "boss", text: `${running ? "插话" : "派发"}：${clip(msg.text, 300)}` });
+		autoPaused = false;
+		const r = running ? await send({ type: "steer", message: msg.text }) : await prompt(msg.text);
+		if (r.success) emit({ kind: "boss", text: `${running ? "插话" : "派发"}：${clip(msg.text, 300)}` });
+		else if (!running) settled();
+		return { ...r, action: running ? "steer" : "prompt" };
 	};
+	const acks = path.join(dir, "acks");
+	fs.mkdirSync(acks, { recursive: true });
+	// 进程中断时已开始投递的指令结果未知，保留原文供核对，避免盲目重放。
+	for (const f of fs.readdirSync(inbox).filter((f) => f.endsWith(".processing"))) {
+		const id = f.slice(0, -".processing".length);
+		const ack = path.join(acks, id);
+		if (!fs.existsSync(ack)) {
+			const error = `消息 ${id} 在中断前未确认；查看 inbox/${f} 和会话记录，核对后再 send`;
+			writeJson(ack, { success: false, error });
+			emit({ kind: "error", text: error });
+		}
+	}
 	let busy = false;
-	poll = setInterval(async () => {
+	const pollInbox = async () => {
 		if (busy) return;
 		busy = true;
 		try {
 			for (const f of fs.readdirSync(inbox).filter((f) => f.endsWith(".json")).sort()) {
 				const file = path.join(inbox, f);
-				const msg = readJson(file, null);
-				fs.rmSync(file, { force: true });
-				if (msg) {
-					await handle(msg);
-					st.lastInbox = f;
-					save();
+				const processing = `${file}.processing`;
+				fs.renameSync(file, processing);
+				let result;
+				try {
+					result = await handle(JSON.parse(fs.readFileSync(processing, "utf8")));
+				} catch (error) {
+					result = { success: false, error: error.message };
+					emit({ kind: "error", text: `消息 ${f} 投递失败：${error.message}` });
 				}
+				writeJson(path.join(acks, f), result);
+				fs.rmSync(processing);
+				if (result.action === "stop") break;
 			}
 		} finally {
 			busy = false;
 		}
-	}, 400);
+	};
 
 	const r = await send({ type: "get_state" });
 	if (r.success) {
@@ -579,20 +637,26 @@ async function daemon(name) {
 		fs.rmSync(resumeFile, { force: true });
 		await handle({ type: "say", text });
 	} else await handle({ type: "say", text: brief });
+	poll = setInterval(pollInbox, 400);
 }
 
 // ---------- 监工命令 ----------
 
 async function post(dir, msg) {
-	const file = `${Date.now()}-${process.pid}.json`;
-	fs.writeFileSync(path.join(dir, "inbox", file), JSON.stringify(msg));
+	if (status(dir).state === "exited") die("worker 已退出；用 resume 接着干");
+	const file = `${Date.now()}-${randomUUID()}.json`;
+	writeJson(path.join(dir, "inbox", file), msg);
 	for (let i = 0; i < 100; i++) {
 		await sleep(200);
 		const st = status(dir);
-		if (st.lastInbox && st.lastInbox >= file) return st;
-		if (st.state === "exited") die("worker 已退出；用 resume 接着干");
+		const ack = readJson(path.join(dir, "acks", file), null);
+		if (ack) {
+			if (!ack.success) die(`消息 ${file} 未成功投递：${ack.error}`);
+			return ack;
+		}
+		if (st.state === "exited") die(`worker 已退出，消息 ${file} 未确认；核对会话后再恢复`);
 	}
-	die("worker 20 秒内没有接收消息");
+	die(`消息 ${file} 20 秒内未确认，可能仍在处理；先查 acks/${file} 与会话记录，勿直接重发`);
 }
 
 function headline(dir) {
@@ -601,9 +665,14 @@ function headline(dir) {
 	const mins = Math.round((Date.now() - Date.parse(meta.started)) / 60000);
 	const ctx = st.contextTokens && st.contextWindow ? `${Math.round((100 * st.contextTokens) / st.contextWindow)}%` : "?";
 	return [
-		`[${meta.name}] ${st.state} | 已运行 ${mins} 分钟 | 改过 ${st.files?.length ?? 0} 个文件 | 上下文 ${ctx} | 费用 $${Number(st.cost ?? 0).toFixed(3)}`,
+		`[${meta.name}] ${st.state} | ${outcomeText(st)} | 已运行 ${mins} 分钟 | 改过 ${st.files?.length ?? 0} 个文件 | 上下文 ${ctx} | 费用 $${Number(st.cost ?? 0).toFixed(3)}`,
 		`cwd: ${meta.cwd}${meta.worktree ? `（worktree，分支 ${meta.worktree.branch}）` : ""}`,
 	];
+}
+
+function outcomeText(st) {
+	return st.outcome === "report" ? "本轮已提交完工报告（待监工验收）"
+		: st.outcome === "ask" ? "本轮已提交请示" : "本轮未提交完工报告";
 }
 
 // 阶段性成果：只给汇报、提问、越界和错误，不给过程。
@@ -663,7 +732,7 @@ async function waitStarted(dir) {
 	for (let i = 0; i < 150; i++) {
 		await sleep(200);
 		const st = status(dir);
-		if (st.state === "running" || st.state === "exited") return;
+		if (st.state !== "starting") return;
 	}
 }
 
@@ -759,7 +828,7 @@ async function cmdWait(names, opt) {
 		if (hit.length || st.state === "exited") {
 			const kinds = new Set(hit.map((e) => e.kind));
 			const upto = hit.length ? hit.at(-1).seq : Infinity;
-			const signal = [...events].reverse().find((e) => e.seq > from && e.seq <= upto && ["report", "ask", "say", "milestone"].includes(e.kind))?.kind;
+			const signal = hit.findLast((e) => e.kind === "settled")?.outcome;
 			return {
 				// 截到最后一条触发事件，之后的动态留给下一次 wait
 				upto,
@@ -774,7 +843,7 @@ async function cmdWait(names, opt) {
 		// 没有定时空醒；只有长时间没有任何动静才叫醒（有命令在跑时放宽三倍，给整库测试留时间）
 		const last = Math.max(started, Date.parse(events.at(-1)?.t ?? 0), Date.parse(st.updated ?? 0));
 		const limit = st.activeTool ? stallMs * 3 : stallMs;
-		if (st.state === "running" && Date.now() - last > limit)
+		if (["running", "compacting", "retrying"].includes(st.state) && Date.now() - last > limit)
 			return { reason: `疑似卡住：${Math.round((Date.now() - last) / 60000)} 分钟没有动静${st.activeTool ? `（${st.activeTool} 仍在执行）` : ""}` };
 		return null;
 	};
@@ -809,9 +878,8 @@ async function cmdSend(name, opt, text) {
 	const dir = requireRun(name);
 	if (opt.file) text = fs.readFileSync(path.resolve(opt.file), "utf8");
 	if (!text?.trim()) die("消息为空");
-	const before = status(dir).state;
-	await post(dir, { type: "say", text });
-	console.log(before === "running" ? "已插话（当前工具调用结束后送达）" : "已派发新一轮");
+	const ack = await post(dir, { type: "say", text });
+	console.log(ack.action === "steer" ? "已插话（当前工具调用结束后送达）" : "已派发新一轮");
 }
 
 async function cmdAbort(name) {
@@ -833,11 +901,12 @@ async function cmdStop(name, opt) {
 				} catch {}
 			}
 		} else {
-			fs.writeFileSync(path.join(dir, "inbox", `${Date.now()}-stop.json`), JSON.stringify({ type: "stop" }));
+			writeJson(path.join(dir, "inbox", `${Date.now()}-${randomUUID()}.json`), { type: "stop" });
 			for (let i = 0; i < 50 && status(dir).state !== "exited"; i++) await sleep(200);
 		}
 	}
-	console.log(status(dir).state === "exited" ? "已收工" : "已请求收工；未退出可用 stop --force");
+	const final = status(dir);
+	console.log(final.state === "exited" ? `已停止；${outcomeText(final)}` : "已请求停止；未退出可用 stop --force");
 	if (meta.worktree) console.log(`worktree 保留在 ${meta.worktree.path}（分支 ${meta.worktree.branch}）。交付后先停 writer、核对路径并检查整树链接；Windows 用 scripts/check-worktree-removal.ps1。检查通过才普通 git worktree remove，不加 --force。`);
 }
 
@@ -848,7 +917,52 @@ function cmdList() {
 		const meta = readJson(path.join(dir, "meta.json"), null);
 		if (!meta) continue;
 		const st = status(dir);
-		console.log(`${name}\t${st.state}\t改过 ${st.files?.length ?? 0} 个文件\t${meta.cwd}\t${meta.started}`);
+		console.log(`${name}\t${st.state}\t${outcomeText(st)}\t改过 ${st.files?.length ?? 0} 个文件\t${meta.cwd}\t${meta.started}`);
+	}
+}
+
+// 用量与速率：从 pi 会话逐条读 assistant 消息。message.timestamp 是请求开始、条目 timestamp 是写入（结束），
+// 二者之差即这一轮的模型时间（含首字延迟），不含等工具的时间。
+function cmdStats(name, opt) {
+	const dir = requireRun(name);
+	const file = status(dir).sessionFile;
+	if (!file || !fs.existsSync(file)) die("还没有会话记录");
+	const turns = [];
+	for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+		if (!line) continue;
+		let e;
+		try {
+			e = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		const m = e.message;
+		// 中止或出错的请求没有用量，算进来只会拉低速率
+		if (m?.role !== "assistant" || !m.usage?.totalTokens || !e.timestamp || !m.timestamp) continue;
+		const secs = (Date.parse(e.timestamp) - Number(m.timestamp)) / 1000;
+		turns.push({ at: e.timestamp, secs: Math.max(secs, 0), ...m.usage });
+	}
+	if (!turns.length) die("会话里还没有模型回复");
+	const sum = (rows, key) => rows.reduce((s, r) => s + (r[key] ?? 0), 0);
+	const rate = (rows) => {
+		const secs = sum(rows, "secs");
+		return secs > 0 ? `${Math.round(sum(rows, "output") / secs)} tok/s` : "—";
+	};
+	const long = turns.filter((t) => (t.output ?? 0) >= 300);
+	const prompt = sum(turns, "input") + sum(turns, "cacheRead") + sum(turns, "cacheWrite");
+	const cost = turns.reduce((s, t) => s + (t.cost?.total ?? 0), 0);
+	const wall = (Date.parse(turns.at(-1).at) - Date.parse(turns[0].at)) / 1000;
+	const mins = (s) => `${(s / 60).toFixed(1)} 分钟`;
+	const last = Number(opt.last ?? 10);
+	console.log(`[${name}] ${turns.length} 轮 · 模型时间 ${mins(sum(turns, "secs"))} / 墙钟 ${mins(wall)} · 费用 $${cost.toFixed(3)}`);
+	console.log(`输出 ${sum(turns, "output")}（其中推理 ${sum(turns, "reasoning")}）· 输入 ${sum(turns, "input")} · 缓存读 ${sum(turns, "cacheRead")} · 缓存写 ${sum(turns, "cacheWrite")}`);
+	console.log(`缓存命中 ${prompt ? Math.round((100 * sum(turns, "cacheRead")) / prompt) : 0}% · 速率：长回复(≥300 输出) ${rate(long)}（${long.length} 轮）· 全部 ${rate(turns)}`);
+	if (last > 0) {
+		console.log(`最近 ${Math.min(last, turns.length)} 轮：`);
+		for (const t of turns.slice(-last)) {
+			const r = t.secs > 0 ? Math.round((t.output ?? 0) / t.secs) : 0;
+			console.log(`  ${t.at.slice(11, 19)}  ${t.secs.toFixed(1).padStart(5)}s  输出 ${String(t.output ?? 0).padStart(5)}  ${String(r).padStart(4)} tok/s  缓存读 ${t.cacheRead ?? 0}`);
+		}
 	}
 }
 
@@ -860,6 +974,7 @@ const USAGE = `用法：
              完成汇报 / 停下 / 越界 / 退出 / 疑似卡住 时返回，里程碑攒到返回时一起给；--milestones 逐段返回
              给多个名字时哪个先有结果就返回哪个
   piw log    <名> [--since 序号]            过程明细（默认最近 80 条）
+  piw stats  <名> [--last N=10]             用量、缓存命中、费用与输出速率（tok/s）
   piw send   <名> "消息" | --file 文件      运行中插话，停下时派发新一轮
   piw scope  <名> [add|keep-out <路径>...]   查看或扩充范围（授权 pi 改清单外的文件时用）
   piw abort  <名>
@@ -878,6 +993,9 @@ switch (cmd) {
 		break;
 	case "log":
 		console.log(timeline(requireRun(pos[0]), opt.since === undefined ? undefined : Number(opt.since)));
+		break;
+	case "stats":
+		cmdStats(pos[0], opt);
 		break;
 	case "send":
 		await cmdSend(pos[0], opt, pos.slice(1).join(" "));
